@@ -230,16 +230,31 @@ def print_summary(
 
     for name, result in results.items():
         fc = result.forecast
+
+        # .item() is the safest way to extract a single scalar from
+        # numpy arrays or pandas objects regardless of dimensionality.
         last_price = result.train_df["y"].iloc[-1]
-        last_forecast = fc["yhat"].iloc[-1]
+        if hasattr(last_price, "item"):
+            last_price = last_price.item()
+
+        last_forecast = fc["yhat"].values[-1]
+        if hasattr(last_forecast, "item"):
+            last_forecast = last_forecast.item()
+
         pct_change = (last_forecast / last_price - 1) * 100
 
         print(f"  ┌─ {name}")
         print(f"  │  Horizon      : {result.horizon} steps")
         print(f"  │  Last price   : {last_price:,.4f}")
         print(f"  │  Forecast end : {last_forecast:,.4f}  ({pct_change:+.2f}%)")
+
         if "yhat_lo" in fc.columns:
-            lo, hi = fc["yhat_lo"].iloc[-1], fc["yhat_hi"].iloc[-1]
+            lo_raw = fc["yhat_lo"].values.ravel()[-1]
+            hi_raw = fc["yhat_hi"].values.ravel()[-1]
+
+            lo = float(lo_raw)
+            hi = float(hi_raw)
+
             print(f"  │  80% CI       : [{lo:,.4f} – {hi:,.4f}]")
         print(f"  └{'─' * 40}\n")
 

@@ -17,6 +17,9 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import torch
+from neuralforecast import NeuralForecast
+from neuralforecast.losses.pytorch import MQLoss
+from neuralforecast.models import NHITS
 
 warnings.filterwarnings("ignore")
 
@@ -61,7 +64,6 @@ def _infer_freq(ds: pd.Series) -> str:
 def _future_dates(last_date: pd.Timestamp, horizon: int, freq: str) -> pd.DatetimeIndex:
     """Generate *horizon* future business/calendar dates after *last_date*."""
     if freq == "B":
-        # business days
         return pd.bdate_range(start=last_date, periods=horizon + 1, freq="B")[1:]
     return pd.date_range(start=last_date, periods=horizon + 1, freq=freq)[1:]
 
@@ -79,6 +81,10 @@ def run_chronos(
 ) -> ForecastResult:
     """Run Amazon Chronos (zero-shot transformer).
 
+    Uses the official ``chronos-forecasting`` pipeline from the
+    ``autogluon.timeseries`` / ``chronos`` package when available,
+    otherwise falls back to loading the model directly via ``transformers``.
+
     Parameters
     ----------
     df:
@@ -94,34 +100,83 @@ def run_chronos(
     -------
     ForecastResult
     """
-    from transformers import pipeline  # type: ignore
-
     model_id = f"amazon/chronos-t5-{model_size}"
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     print(f"  ⏳ Loading Chronos [{model_size}] on {device} …")
-    pipe = pipeline(
-        "text-generation",
-        model=model_id,
-        device=device,
-        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-        trust_remote_code=True,
-    )
 
-    context = torch.tensor(df["y"].values, dtype=torch.float32).unsqueeze(0)
+    # ── Try the official Chronos pipeline (installed via pip install chronos-forecasting)
+    try:
+        from chronos import ChronosPipeline
 
-    print(f"  🔮 Forecasting {horizon} steps …")
-    output = pipe(
-        context,
-        prediction_length=horizon,
-        num_samples=num_samples,
-    )
+        pipe = ChronosPipeline.from_pretrained(
+            model_id,
+            device_map=device,
+            dtype=dtype,
+        )
+        context = torch.tensor(df["y"].values, dtype=torch.float32)
 
-    # output[0] shape: (num_samples, horizon)
-    samples = np.array(output[0])  # (S, H)
-    yhat = samples.mean(axis=0)
-    yhat_lo = np.percentile(samples, 10, axis=0)
-    yhat_hi = np.percentile(samples, 90, axis=0)
+        print(f"  🔮 Forecasting {horizon} steps (ChronosPipeline) …")
+
+        # Capture the tuple (forecast, scale)
+        forecast_data = pipe.predict_quantiles(
+            context.unsqueeze(0),
+            prediction_length=horizon,
+            quantile_levels=[0.1, 0.5, 0.9],
+            num_samples=num_samples,
+        )
+
+        # forecast_data[0] is a tensor of shape (batch, horizon, num_quantiles)
+        forecast_tensor = forecast_data[0]
+
+        # Unpack the quantiles from the last dimension
+        # 0 = 0.1, 1 = 0.5 (median), 2 = 0.9
+        yhat = forecast_tensor[0, :, 1].numpy()
+        yhat_lo = forecast_tensor[0, :, 0].numpy()
+        yhat_hi = forecast_tensor[0, :, 2].numpy()
+
+    except ImportError:
+        # ── Fallback: load the AutoRegressive model directly via transformers
+        #    (works without the chronos-forecasting extra package)
+        print("  ℹ️  chronos-forecasting not found – using transformers fallback …")
+        from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
+
+        # Chronos uses T5 under the hood; we load it and run sampling manually
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_id, config=config, torch_dtype=dtype, trust_remote_code=True).to(
+            device
+        )
+
+        # The Chronos T5 models expose a `generate` method that accepts raw
+        # float context via their custom tokenizer.
+        context_np = df["y"].values.astype(np.float32)
+
+        # Tokenise context (Chronos tokenizer returns input_ids & attention_mask)
+        inputs = tokenizer(
+            context_np,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        print(f"  🔮 Forecasting {horizon} steps (transformers fallback) …")
+        with torch.no_grad():
+            sample_ids = model.generate(
+                **inputs,
+                min_new_tokens=horizon,
+                max_new_tokens=horizon,
+                do_sample=True,
+                num_return_sequences=num_samples,
+            )
+
+        # Decode back to float values
+        samples = tokenizer.decode(sample_ids, target_length=horizon)  # (S, H)
+        samples = np.array(samples)
+
+        yhat = samples.mean(axis=0)
+        yhat_lo = np.percentile(samples, 10, axis=0)
+        yhat_hi = np.percentile(samples, 90, axis=0)
 
     freq = _infer_freq(df["ds"])
     future_ds = _future_dates(df["ds"].iloc[-1], horizon, freq)
@@ -149,37 +204,13 @@ def run_nhits(
     val_check_steps: int = 50,
     early_stop_patience: int = 5,
 ) -> ForecastResult:
-    """Train and run N-HiTS on the fly.
+    """Train and run N-HiTS on the fly."""
 
-    Parameters
-    ----------
-    df:
-        DataFrame with columns ``ds`` (datetime) and ``y`` (float).
-    horizon:
-        Steps to predict.
-    input_size_multiplier:
-        ``input_size = horizon * multiplier`` – context window.
-    max_steps:
-        Training iterations.
-    val_check_steps / early_stop_patience:
-        Early stopping configuration.
-
-    Returns
-    -------
-    ForecastResult
-    """
-    from neuralforecast import NeuralForecast  # type: ignore
-    from neuralforecast.losses.pytorch import MQLoss  # type: ignore
-    from neuralforecast.models import NHITS  # type: ignore
-
-    # NeuralForecast expects a "unique_id" column
     nf_df = df[["ds", "y"]].copy()
     nf_df["unique_id"] = "series_1"
     nf_df = nf_df[["unique_id", "ds", "y"]]
 
     input_size = horizon * input_size_multiplier
-
-    # Quantile loss → prediction intervals
     loss = MQLoss(level=[80, 90])
 
     model = NHITS(
@@ -194,13 +225,13 @@ def run_nhits(
 
     print(f"  🏋️  Training N-HiTS (max_steps={max_steps}) …")
     nf = NeuralForecast(models=[model], freq=_infer_freq(df["ds"]))
-    nf.fit(df=nf_df)
+    nf.fit(df=nf_df, val_size=horizon)
 
     print(f"  🔮 Forecasting {horizon} steps …")
     pred = nf.predict().reset_index()
 
-    # Rename NeuralForecast columns
-    col_map = {}
+    # ── Rename NeuralForecast output columns ─────────────────────────────────
+    col_map: dict[str, str] = {}
     for c in pred.columns:
         cl = c.lower()
         if "median" in cl or cl.endswith("-median"):
@@ -210,7 +241,6 @@ def run_nhits(
         elif "hi-80" in cl or "hi80" in cl:
             col_map[c] = "yhat_hi"
 
-    # Fallback: use first NHITS column as point forecast
     nhits_cols = [c for c in pred.columns if "NHITS" in c]
     if "yhat" not in col_map and nhits_cols:
         col_map[nhits_cols[0]] = "yhat"
@@ -221,16 +251,16 @@ def run_nhits(
 
     pred = pred.rename(columns=col_map)
 
-    needed = [c for c in ["yhat", "yhat_lo", "yhat_hi"] if c not in pred.columns]
-    if needed:
-        # Construct missing interval columns from available ones
-        if "yhat" in pred.columns:
-            if "yhat_lo" not in pred.columns:
-                pred["yhat_lo"] = pred["yhat"] * 0.97
-            if "yhat_hi" not in pred.columns:
-                pred["yhat_hi"] = pred["yhat"] * 1.03
+    if "yhat" in pred.columns:
+        if "yhat_lo" not in pred.columns:
+            pred["yhat_lo"] = pred["yhat"] * 0.97
+        if "yhat_hi" not in pred.columns:
+            pred["yhat_hi"] = pred["yhat"] * 1.03
 
     forecast_df = pred[["ds", "yhat", "yhat_lo", "yhat_hi"]].copy()
+    forecast_df["yhat"] = forecast_df["yhat"].astype(float)
+    forecast_df["yhat_lo"] = forecast_df["yhat_lo"].astype(float)
+    forecast_df["yhat_hi"] = forecast_df["yhat_hi"].astype(float)
     forecast_df["ds"] = pd.to_datetime(forecast_df["ds"])
 
     return ForecastResult(

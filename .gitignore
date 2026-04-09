@@ -176,6 +176,7 @@ data/
 temp/
 cache/
 logs/
+*/lightning_logs
 
 # ==============================
 # File immagine
