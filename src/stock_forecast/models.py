@@ -1,11 +1,17 @@
-"""Forecasting models.
+"""Forecasting models with train/validation model selection.
 
-Two complementary approaches:
-- **Chronos** (Amazon, zero-shot transformer): no training needed, fast inference.
-- **N-HiTS** (NeuralForecast): trained on the fly on the downloaded series.
+Pipeline:
+1. Split series into train / validation sets.
+2. Train multiple models on the train set.
+3. Evaluate each on the validation set (MAE, RMSE, MAPE).
+4. Select the best model based on validation MAPE.
+5. Retrain the winner on the **full** series.
+6. Produce the final n-step-ahead forecast.
 
-Both return a ``ForecastResult`` dataframe with columns
-``["ds", "yhat", "yhat_lo", "yhat_hi"]``.
+Models available:
+- **Chronos** (Amazon, zero-shot transformer)
+- **N-HiTS** (NeuralForecast)
+- **N-BEATS** (NeuralForecast)
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import pandas as pd
 import torch
 from neuralforecast import NeuralForecast
 from neuralforecast.losses.pytorch import MQLoss
-from neuralforecast.models import NHITS
+from neuralforecast.models import NBEATS, NHITS
 
 warnings.filterwarnings("ignore")
 
@@ -41,6 +47,47 @@ class ForecastResult:
 
     def __repr__(self) -> str:
         return f"ForecastResult(model={self.model_name!r}, horizon={self.horizon}, rows={len(self.forecast)})"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Metrics
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """Compute MAE, RMSE, MAPE between actual and predicted values."""
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    # Avoid division by zero in MAPE
+    mask = y_true != 0
+    mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100) if mask.any() else float("inf")
+    return {"mae": mae, "rmse": rmse, "mape": mape}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Train / Validation split
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def train_val_split(df: pd.DataFrame, val_size: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split a time series DataFrame into train and validation sets.
+
+    Parameters
+    ----------
+    df:
+        DataFrame with at least columns ``ds`` and ``y``.
+    val_size:
+        Number of most-recent observations to hold out for validation.
+
+    Returns
+    -------
+    (train_df, val_df)
+    """
+    df = df.sort_values("ds").reset_index(drop=True)
+    split_idx = len(df) - val_size
+    return df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -192,7 +239,48 @@ def run_chronos(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# N-HiTS (NeuralForecast, trained on-the-fly)
+# NeuralForecast helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _nf_predict_to_forecast_df(pred: pd.DataFrame, model_prefix: str) -> pd.DataFrame:
+    """Normalize NeuralForecast predict output to standard columns."""
+    col_map: dict[str, str] = {}
+    for c in pred.columns:
+        cl = c.lower()
+        if "median" in cl or cl.endswith("-median"):
+            col_map[c] = "yhat"
+        elif "lo-80" in cl or "lo80" in cl:
+            col_map[c] = "yhat_lo"
+        elif "hi-80" in cl or "hi80" in cl:
+            col_map[c] = "yhat_hi"
+
+    model_cols = [c for c in pred.columns if model_prefix in c]
+    if "yhat" not in col_map.values() and model_cols:
+        col_map[model_cols[0]] = "yhat"
+    if "yhat_lo" not in col_map.values() and len(model_cols) > 1:
+        col_map[model_cols[1]] = "yhat_lo"
+    if "yhat_hi" not in col_map.values() and len(model_cols) > 2:
+        col_map[model_cols[2]] = "yhat_hi"
+
+    pred = pred.rename(columns=col_map)
+
+    if "yhat" in pred.columns:
+        if "yhat_lo" not in pred.columns:
+            pred["yhat_lo"] = pred["yhat"] * 0.97
+        if "yhat_hi" not in pred.columns:
+            pred["yhat_hi"] = pred["yhat"] * 1.03
+
+    forecast_df = pred[["ds", "yhat", "yhat_lo", "yhat_hi"]].copy()
+    forecast_df["yhat"] = forecast_df["yhat"].astype(float)
+    forecast_df["yhat_lo"] = forecast_df["yhat_lo"].astype(float)
+    forecast_df["yhat_hi"] = forecast_df["yhat_hi"].astype(float)
+    forecast_df["ds"] = pd.to_datetime(forecast_df["ds"])
+    return forecast_df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# N-HiTS (NeuralForecast)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -205,13 +293,12 @@ def run_nhits(
     early_stop_patience: int = 5,
 ) -> ForecastResult:
     """Train and run N-HiTS on the fly."""
-
     nf_df = df[["ds", "y"]].copy()
     nf_df["unique_id"] = "series_1"
     nf_df = nf_df[["unique_id", "ds", "y"]]
 
     input_size = horizon * input_size_multiplier
-    loss = MQLoss(level=[80, 90])
+    loss = MQLoss(level=[80])
 
     model = NHITS(
         h=horizon,
@@ -229,39 +316,7 @@ def run_nhits(
 
     print(f"  🔮 Forecasting {horizon} steps …")
     pred = nf.predict().reset_index()
-
-    # ── Rename NeuralForecast output columns ─────────────────────────────────
-    col_map: dict[str, str] = {}
-    for c in pred.columns:
-        cl = c.lower()
-        if "median" in cl or cl.endswith("-median"):
-            col_map[c] = "yhat"
-        elif "lo-80" in cl or "lo80" in cl:
-            col_map[c] = "yhat_lo"
-        elif "hi-80" in cl or "hi80" in cl:
-            col_map[c] = "yhat_hi"
-
-    nhits_cols = [c for c in pred.columns if "NHITS" in c]
-    if "yhat" not in col_map and nhits_cols:
-        col_map[nhits_cols[0]] = "yhat"
-    if "yhat_lo" not in col_map and len(nhits_cols) > 1:
-        col_map[nhits_cols[1]] = "yhat_lo"
-    if "yhat_hi" not in col_map and len(nhits_cols) > 2:
-        col_map[nhits_cols[2]] = "yhat_hi"
-
-    pred = pred.rename(columns=col_map)
-
-    if "yhat" in pred.columns:
-        if "yhat_lo" not in pred.columns:
-            pred["yhat_lo"] = pred["yhat"] * 0.97
-        if "yhat_hi" not in pred.columns:
-            pred["yhat_hi"] = pred["yhat"] * 1.03
-
-    forecast_df = pred[["ds", "yhat", "yhat_lo", "yhat_hi"]].copy()
-    forecast_df["yhat"] = forecast_df["yhat"].astype(float)
-    forecast_df["yhat_lo"] = forecast_df["yhat_lo"].astype(float)
-    forecast_df["yhat_hi"] = forecast_df["yhat_hi"].astype(float)
-    forecast_df["ds"] = pd.to_datetime(forecast_df["ds"])
+    forecast_df = _nf_predict_to_forecast_df(pred, "NHITS")
 
     return ForecastResult(
         model_name="N-HiTS",
@@ -272,7 +327,219 @@ def run_nhits(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Convenience: run both and return dict
+# N-BEATS (NeuralForecast)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def run_nbeats(
+    df: pd.DataFrame,
+    horizon: int,
+    input_size_multiplier: int = 5,
+    max_steps: int = 500,
+    val_check_steps: int = 50,
+    early_stop_patience: int = 5,
+) -> ForecastResult:
+    """Train and run N-BEATS on the fly."""
+    nf_df = df[["ds", "y"]].copy()
+    nf_df["unique_id"] = "series_1"
+    nf_df = nf_df[["unique_id", "ds", "y"]]
+
+    input_size = horizon * input_size_multiplier
+    loss = MQLoss(level=[80])
+
+    model = NBEATS(
+        h=horizon,
+        input_size=input_size,
+        loss=loss,
+        max_steps=max_steps,
+        val_check_steps=val_check_steps,
+        early_stop_patience_steps=early_stop_patience,
+        enable_progress_bar=True,
+    )
+
+    print(f"  🏋️  Training N-BEATS (max_steps={max_steps}) …")
+    nf = NeuralForecast(models=[model], freq=_infer_freq(df["ds"]))
+    nf.fit(df=nf_df, val_size=horizon)
+
+    print(f"  🔮 Forecasting {horizon} steps …")
+    pred = nf.predict().reset_index()
+    forecast_df = _nf_predict_to_forecast_df(pred, "NBEATS")
+
+    return ForecastResult(
+        model_name="N-BEATS",
+        horizon=horizon,
+        forecast=forecast_df,
+        train_df=df,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model Selection Pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Registry of model runners: name → callable(df, horizon, **kwargs) → ForecastResult
+MODEL_REGISTRY: dict[str, callable] = {
+    "N-HiTS": run_nhits,
+    "N-BEATS": run_nbeats,
+    "Chronos": run_chronos,
+}
+
+
+def validate_models(
+    df: pd.DataFrame,
+    horizon: int,
+    models: list[str] | None = None,
+    chronos_size: str = "small",
+    max_steps: int = 500,
+) -> dict[str, dict]:
+    """Train each model on train set, evaluate on validation set.
+
+    Parameters
+    ----------
+    df:
+        Full time series with columns ``ds``, ``y``.
+    horizon:
+        Forecast horizon (also used as validation set size).
+    models:
+        List of model names to evaluate. Default: all registered.
+    chronos_size:
+        Chronos variant size.
+    max_steps:
+        Max training steps for neural models.
+
+    Returns
+    -------
+    dict mapping model_name → {"metrics": {...}, "forecast": ForecastResult}
+    """
+    if models is None:
+        models = list(MODEL_REGISTRY.keys())
+
+    train_df, val_df = train_val_split(df, val_size=horizon)
+    val_y = val_df["y"].values
+
+    results: dict[str, dict] = {}
+
+    for name in models:
+        print(f"\n── Validating: {name} ─────────────────────────────────")
+        try:
+            if name == "Chronos":
+                result = run_chronos(train_df, horizon, model_size=chronos_size)
+            elif name == "N-HiTS":
+                result = run_nhits(train_df, horizon, max_steps=max_steps)
+            elif name == "N-BEATS":
+                result = run_nbeats(train_df, horizon, max_steps=max_steps)
+            else:
+                runner = MODEL_REGISTRY[name]
+                result = runner(train_df, horizon)
+
+            pred_y = result.forecast["yhat"].values[: len(val_y)]
+            metrics = compute_metrics(val_y, pred_y)
+            result.metrics = metrics
+
+            results[name] = {"metrics": metrics, "result": result}
+            print(f"  ✅ MAE={metrics['mae']:.4f}  RMSE={metrics['rmse']:.4f}  MAPE={metrics['mape']:.2f}%")
+
+        except Exception as e:
+            print(f"  ⚠️  {name} failed: {e}")
+            results[name] = {"metrics": {"mae": float("inf"), "rmse": float("inf"), "mape": float("inf")}, "result": None}
+
+    return results
+
+
+def select_best_model(
+    validation_results: dict[str, dict],
+    metric: str = "mape",
+) -> str:
+    """Select the best model name based on a validation metric (lower is better)."""
+    best_name = None
+    best_score = float("inf")
+    for name, data in validation_results.items():
+        score = data["metrics"].get(metric, float("inf"))
+        if score < best_score:
+            best_score = score
+            best_name = name
+    return best_name
+
+
+def run_best_model(
+    df: pd.DataFrame,
+    horizon: int,
+    best_model_name: str,
+    chronos_size: str = "small",
+    max_steps: int = 500,
+) -> ForecastResult:
+    """Retrain the best model on the **full** series and produce the final forecast."""
+    print(f"\n{'═' * 55}")
+    print(f"  🏆 Best model: {best_model_name}")
+    print(f"  🔄 Retraining on full series ({len(df)} obs) …")
+    print(f"{'═' * 55}\n")
+
+    if best_model_name == "Chronos":
+        return run_chronos(df, horizon, model_size=chronos_size)
+    if best_model_name == "N-HiTS":
+        return run_nhits(df, horizon, max_steps=max_steps)
+    if best_model_name == "N-BEATS":
+        return run_nbeats(df, horizon, max_steps=max_steps)
+    runner = MODEL_REGISTRY[best_model_name]
+    return runner(df, horizon)
+
+
+def run_pipeline(
+    df: pd.DataFrame,
+    horizon: int,
+    models: list[str] | None = None,
+    chronos_size: str = "small",
+    max_steps: int = 500,
+    selection_metric: str = "mape",
+) -> tuple[dict[str, dict], ForecastResult]:
+    """Full pipeline: validate → select best → retrain on full data → forecast.
+
+    Parameters
+    ----------
+    df:
+        Full time series.
+    horizon:
+        Number of steps to forecast.
+    models:
+        Which models to compare. Default: all registered.
+    chronos_size:
+        Chronos variant.
+    max_steps:
+        Training budget for neural models.
+    selection_metric:
+        Metric to use for model selection ("mae", "rmse", or "mape").
+
+    Returns
+    -------
+    (validation_results, final_forecast)
+    """
+    print("╔═══════════════════════════════════════════════════════╗")
+    print("║          MODEL SELECTION PIPELINE                    ║")
+    print("╚═══════════════════════════════════════════════════════╝")
+    print(f"\n  Series length : {len(df)} observations")
+    print(f"  Horizon       : {horizon} steps")
+    print(f"  Val set size  : {horizon} (last {horizon} obs)")
+    print(f"  Metric        : {selection_metric}\n")
+
+    # Step 1: Validate all models
+    val_results = validate_models(df, horizon, models=models, chronos_size=chronos_size, max_steps=max_steps)
+
+    # Step 2: Select best
+    best_name = select_best_model(val_results, metric=selection_metric)
+
+    if best_name is None:
+        msg = "All models failed during validation."
+        raise RuntimeError(msg)
+
+    # Step 3: Retrain on full data and forecast
+    final_result = run_best_model(df, horizon, best_name, chronos_size=chronos_size, max_steps=max_steps)
+    final_result.metrics = val_results[best_name]["metrics"]
+
+    return val_results, final_result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Legacy convenience function (backward-compatible)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -282,7 +549,7 @@ def run_all(
     chronos_size: str = "small",
     nhits_steps: int = 300,
 ) -> dict[str, ForecastResult]:
-    """Run Chronos + N-HiTS and return results keyed by model name."""
+    """Run all models and return results keyed by model name (no validation)."""
     results: dict[str, ForecastResult] = {}
 
     print("\n── Chronos ─────────────────────────────────────────────")
@@ -296,5 +563,11 @@ def run_all(
         results["nhits"] = run_nhits(df, horizon, max_steps=nhits_steps)
     except Exception as e:
         print(f"  ⚠️  N-HiTS failed: {e}")
+
+    print("\n── N-BEATS ─────────────────────────────────────────────")
+    try:
+        results["nbeats"] = run_nbeats(df, horizon, max_steps=nhits_steps)
+    except Exception as e:
+        print(f"  ⚠️  N-BEATS failed: {e}")
 
     return results

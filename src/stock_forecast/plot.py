@@ -62,6 +62,10 @@ def plot_forecast(
     if isinstance(results, ForecastResult):
         results = {results.model_name: results}
 
+    if not results:
+        msg = "No forecast results to plot. All models may have failed."
+        raise ValueError(msg)
+
     # Pick any result to get the training series (they share the same history)
     any_result = next(iter(results.values()))
     hist = any_result.train_df.copy()
@@ -170,15 +174,23 @@ def plot_forecast(
     # ── Vertical line at forecast start ───────────────────────────────────────
     split_date = any_result.train_df["ds"].max()
     fig.add_vline(
-        x=split_date.timestamp() * 1000,
+        x=split_date,
         line_dash="dot",
         line_color="gray",
-        annotation_text="Forecast start",
-        annotation_position="top left",
+    )
+    fig.add_annotation(
+        x=split_date,
+        y=1,
+        yref="paper",
+        text="Forecast start",
+        showarrow=False,
+        xanchor="right",
+        yanchor="top",
+        font={"color": "gray", "size": 11},
     )
 
     # ── Layout ────────────────────────────────────────────────────────────────
-    auto_title = title or f"{ticker} – Price Forecast" if ticker else "Price Forecast"
+    auto_title = title or (f"{ticker} – Price Forecast" if ticker else "Price Forecast")
     fig.update_layout(
         title={"text": auto_title, "font": {"size": 20}},
         xaxis_rangeslider_visible=False,
@@ -256,7 +268,24 @@ def print_summary(
             hi = float(hi_raw)
 
             print(f"  │  80% CI       : [{lo:,.4f} – {hi:,.4f}]")
+        if result.metrics:
+            print(f"  │  Val MAPE     : {result.metrics.get('mape', 0):.2f}%")
         print(f"  └{'─' * 40}\n")
+
+
+def print_validation_table(validation_results: dict[str, dict], best_name: str | None = None) -> None:
+    """Print a comparison table of all validated models."""
+    print(f"\n{'═' * 60}")
+    print(f"  {'Model':<15} {'MAE':>10} {'RMSE':>10} {'MAPE':>10}  {'':>5}")
+    print(f"  {'─' * 55}")
+    for name, data in validation_results.items():
+        m = data["metrics"]
+        marker = " 🏆" if name == best_name else ""
+        if m["mae"] == float("inf"):
+            print(f"  {name:<15} {'FAILED':>10} {'':>10} {'':>10}{marker}")
+        else:
+            print(f"  {name:<15} {m['mae']:>10.4f} {m['rmse']:>10.4f} {m['mape']:>9.2f}%{marker}")
+    print(f"{'═' * 60}\n")
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ lib64/
 parts/
 sdist/
 var/
+outputs/
 wheels/
 share/python-wheels/
 *.egg-info/
@@ -217,3 +218,8 @@ Thumbs.db
 *.tmp
 *.swp
 *.bak
+
+# ==============================
+# WEB files
+# ==============================
+*.html
