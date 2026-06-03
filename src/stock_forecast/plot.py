@@ -18,6 +18,8 @@ _COLORS = {
     "Chronos-large": "#EF553B",
     "N-HiTS": "#00CC96",
     "N-BEATS": "#AB63FA",
+    "Auto-ARIMA": "#19D3F3",
+    "XGBoost": "#FF6692",
     "default": "#FFA15A",
 }
 

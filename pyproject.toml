@@ -20,7 +20,9 @@ dependencies = [
     "python-dotenv",
     "requests",
     "scipy",
-    "chronos-forecasting (>=2.2.2,<3.0.0)"
+    "chronos-forecasting (>=2.2.2,<3.0.0)",
+    "statsmodels",
+    "xgboost",
 ]
 
 [tool.poetry]

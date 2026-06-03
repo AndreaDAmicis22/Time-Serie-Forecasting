@@ -12,6 +12,8 @@ Models available:
 - **Chronos** (Amazon, zero-shot transformer)
 - **N-HiTS** (NeuralForecast)
 - **N-BEATS** (NeuralForecast)
+- **Auto-ARIMA** (statsmodels, with stationarity enforcement)
+- **XGBoost** (gradient boosting with lag features)
 """
 
 from __future__ import annotations
@@ -26,6 +28,9 @@ import torch
 from neuralforecast import NeuralForecast
 from neuralforecast.losses.pytorch import MQLoss
 from neuralforecast.models import NBEATS, NHITS
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import adfuller
+from xgboost import XGBRegressor
 
 warnings.filterwarnings("ignore")
 
@@ -239,6 +244,205 @@ def run_chronos(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Stationarity helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _check_stationarity(y: np.ndarray, significance: float = 0.05) -> tuple[bool, float]:
+    """Run Augmented Dickey-Fuller test.
+
+    Returns (is_stationary, p_value).
+    """
+    result = adfuller(y, autolag="AIC")
+    p_value = result[1]
+    return p_value < significance, p_value
+
+
+def _make_stationary(y: np.ndarray, max_d: int = 2) -> tuple[np.ndarray, int]:
+    """Difference the series until it passes the ADF test.
+
+    Returns (stationary_series, d) where d is the number of differencings applied.
+    """
+    d = 0
+    current = y.copy()
+    for _ in range(max_d):
+        is_stat, _p = _check_stationarity(current)
+        if is_stat:
+            break
+        current = np.diff(current)
+        d += 1
+    return current, d
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auto-ARIMA (statsmodels)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def run_arima(
+    df: pd.DataFrame,
+    horizon: int,
+    max_p: int = 5,
+    max_q: int = 5,
+    max_d: int = 2,
+    seasonal: bool = False,
+) -> ForecastResult:
+    """Fit ARIMA with automatic stationarity enforcement and order selection.
+
+    The function:
+    1. Tests stationarity via ADF and determines the differencing order d.
+    2. Searches (p, q) combinations via AIC to pick the best ARIMA(p, d, q).
+    3. Forecasts *horizon* steps ahead with confidence intervals.
+    """
+    y = df["y"].values.astype(float)
+
+    # ── Step 1: Determine d via ADF test ──────────────────────────────────────
+    is_stationary, p_value = _check_stationarity(y)
+    print(f"  📊 ADF test p-value: {p_value:.6f} → {'stationary' if is_stationary else 'non-stationary'}")
+
+    _, d = _make_stationary(y, max_d=max_d)
+    print(f"  📐 Differencing order d={d}")
+
+    # ── Step 2: Grid search for best (p, q) by AIC ───────────────────────────
+    print(f"  🔍 Searching ARIMA orders (p=0..{max_p}, d={d}, q=0..{max_q}) …")
+    best_aic = float("inf")
+    best_order = (1, d, 1)
+
+    for p in range(max_p + 1):
+        for q in range(max_q + 1):
+            if p == 0 and q == 0:
+                continue
+            try:
+                model = SARIMAX(y, order=(p, d, q), enforce_stationarity=True, enforce_invertibility=True)
+                fit = model.fit(disp=False, maxiter=200)
+                if fit.aic < best_aic:
+                    best_aic = fit.aic
+                    best_order = (p, d, q)
+            except Exception:
+                continue
+
+    print(f"  ✅ Best order: ARIMA{best_order} (AIC={best_aic:.2f})")
+
+    # ── Step 3: Fit final model and forecast ──────────────────────────────────
+    final_model = SARIMAX(y, order=best_order, enforce_stationarity=True, enforce_invertibility=True)
+    final_fit = final_model.fit(disp=False, maxiter=500)
+
+    forecast_obj = final_fit.get_forecast(steps=horizon)
+    yhat = np.asarray(forecast_obj.predicted_mean)
+    conf_int = np.asarray(forecast_obj.conf_int(alpha=0.2))  # 80% CI
+
+    freq = _infer_freq(df["ds"])
+    future_ds = _future_dates(df["ds"].iloc[-1], horizon, freq)
+
+    forecast_df = pd.DataFrame(
+        {
+            "ds": future_ds,
+            "yhat": yhat,
+            "yhat_lo": conf_int[:, 0],
+            "yhat_hi": conf_int[:, 1],
+        }
+    )
+
+    return ForecastResult(
+        model_name="Auto-ARIMA",
+        horizon=horizon,
+        forecast=forecast_df,
+        train_df=df,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# XGBoost (ML with lag features)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _create_lag_features(y: np.ndarray, n_lags: int) -> tuple[np.ndarray, np.ndarray]:
+    """Create supervised learning dataset from a 1-D time series.
+
+    Returns (X, Y) where each row of X contains [y(t-n_lags), ..., y(t-1)]
+    and Y contains y(t).
+    """
+    X, Y = [], []
+    for i in range(n_lags, len(y)):
+        X.append(y[i - n_lags : i])
+        Y.append(y[i])
+    return np.array(X), np.array(Y)
+
+
+def run_xgboost(
+    df: pd.DataFrame,
+    horizon: int,
+    n_lags: int | None = None,
+    n_estimators: int = 500,
+    learning_rate: float = 0.05,
+    max_depth: int = 6,
+) -> ForecastResult:
+    """Train XGBoost regressor with lag features for time series forecasting.
+
+    Uses a recursive multi-step strategy: predict one step, feed prediction
+    back as a feature for the next step.
+    """
+    y = df["y"].values.astype(float)
+
+    if n_lags is None:
+        n_lags = min(max(horizon * 3, 30), len(y) // 3)
+
+    X, Y = _create_lag_features(y, n_lags)
+
+    print(f"  🌲 Training XGBoost (lags={n_lags}, estimators={n_estimators}) …")
+    model = XGBRegressor(
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        max_depth=max_depth,
+        objective="reg:squarederror",
+        verbosity=0,
+        random_state=42,
+    )
+    model.fit(X, Y)
+
+    # ── Recursive forecasting ─────────────────────────────────────────────────
+    print(f"  🔮 Forecasting {horizon} steps (recursive) …")
+    last_window = y[-n_lags:].copy()
+    predictions = []
+
+    for _ in range(horizon):
+        x_input = last_window.reshape(1, -1)
+        yhat_step = model.predict(x_input)[0]
+        predictions.append(yhat_step)
+        last_window = np.append(last_window[1:], yhat_step)
+
+    yhat = np.array(predictions)
+
+    # ── Confidence interval via residual std on training set ───────────────────
+    train_preds = model.predict(X)
+    residual_std = np.std(Y - train_preds)
+    # Widen intervals further into the future
+    steps = np.arange(1, horizon + 1)
+    interval_width = 1.28 * residual_std * np.sqrt(steps)  # ~80% CI
+    yhat_lo = yhat - interval_width
+    yhat_hi = yhat + interval_width
+
+    freq = _infer_freq(df["ds"])
+    future_ds = _future_dates(df["ds"].iloc[-1], horizon, freq)
+
+    forecast_df = pd.DataFrame(
+        {
+            "ds": future_ds,
+            "yhat": yhat,
+            "yhat_lo": yhat_lo,
+            "yhat_hi": yhat_hi,
+        }
+    )
+
+    return ForecastResult(
+        model_name="XGBoost",
+        horizon=horizon,
+        forecast=forecast_df,
+        train_df=df,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # NeuralForecast helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -382,6 +586,8 @@ MODEL_REGISTRY: dict[str, callable] = {
     "N-HiTS": run_nhits,
     "N-BEATS": run_nbeats,
     "Chronos": run_chronos,
+    "Auto-ARIMA": run_arima,
+    "XGBoost": run_xgboost,
 }
 
 
@@ -418,7 +624,7 @@ def validate_models(
     val_y = val_df["y"].values
 
     results: dict[str, dict] = {}
-
+    print(f"──────────── Models to validate: {', '.join(models)} ────────────")
     for name in models:
         print(f"\n── Validating: {name} ─────────────────────────────────")
         try:
@@ -428,6 +634,10 @@ def validate_models(
                 result = run_nhits(train_df, horizon, max_steps=max_steps)
             elif name == "N-BEATS":
                 result = run_nbeats(train_df, horizon, max_steps=max_steps)
+            elif name == "Auto-ARIMA":
+                result = run_arima(train_df, horizon)
+            elif name == "XGBoost":
+                result = run_xgboost(train_df, horizon)
             else:
                 runner = MODEL_REGISTRY[name]
                 result = runner(train_df, horizon)
@@ -480,6 +690,10 @@ def run_best_model(
         return run_nhits(df, horizon, max_steps=max_steps)
     if best_model_name == "N-BEATS":
         return run_nbeats(df, horizon, max_steps=max_steps)
+    if best_model_name == "Auto-ARIMA":
+        return run_arima(df, horizon)
+    if best_model_name == "XGBoost":
+        return run_xgboost(df, horizon)
     runner = MODEL_REGISTRY[best_model_name]
     return runner(df, horizon)
 
@@ -569,5 +783,17 @@ def run_all(
         results["nbeats"] = run_nbeats(df, horizon, max_steps=nhits_steps)
     except Exception as e:
         print(f"  ⚠️  N-BEATS failed: {e}")
+
+    print("\n── Auto-ARIMA ──────────────────────────────────────────")
+    try:
+        results["arima"] = run_arima(df, horizon)
+    except Exception as e:
+        print(f"  ⚠️  Auto-ARIMA failed: {e}")
+
+    print("\n── XGBoost ─────────────────────────────────────────────")
+    try:
+        results["xgboost"] = run_xgboost(df, horizon)
+    except Exception as e:
+        print(f"  ⚠️  XGBoost failed: {e}")
 
     return results
