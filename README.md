@@ -1,6 +1,13 @@
 # 📈 Stock Forecast
 
-Time-series forecasting for stocks, bonds and commodities using state-of-the-art models.
+Time-series forecasting for stocks, commodities and crypto using a **model selection pipeline**.
+
+## Pipeline
+
+1. **Train/Validation split** – the last *H* observations are held out as a validation set
+2. **Training & Evaluation** – each model is trained on the train set and evaluated on validation
+3. **Selection** – the best model (lowest MAE/RMSE/MAPE) is selected
+4. **Retrain & Forecast** – the winner is retrained on the full series and produces the final forecast
 
 ## Models
 
@@ -8,6 +15,9 @@ Time-series forecasting for stocks, bonds and commodities using state-of-the-art
 |---|---|---|
 | **Chronos** (Amazon) | Zero-shot transformer | No training needed, great out-of-the-box accuracy |
 | **N-HiTS** (NeuralForecast) | Deep learning | Trained on-the-fly, excels on longer horizons |
+| **N-BEATS** (NeuralForecast) | Deep learning | Interpretable architecture, strong on univariate series |
+| **Auto-ARIMA** (statsmodels) | Statistical | Automatic order selection via ADF + AIC grid search |
+| **XGBoost** | Gradient boosting | ML with lag features, fast and robust |
 
 ## Project structure
 
@@ -17,12 +27,11 @@ stock-forecast/
 │   └── stock_forecast/
 │       ├── __init__.py   # public API
 │       ├── data.py       # yfinance download helpers
-│       ├── models.py     # Chronos + N-HiTS wrappers
+│       ├── models.py     # model wrappers + pipeline
 │       └── plot.py       # Plotly interactive charts
 ├── notebooks/
 │   └── forecast.ipynb   # main notebook
 ├── outputs/             # saved HTML charts
-├── data/                # optional: cached CSVs
 └── pyproject.toml
 ```
 
@@ -39,14 +48,15 @@ poetry run jupyter lab notebooks/forecast.ipynb
 ## Configuration (in the notebook)
 
 ```python
-TICKER   = "GC=F"    # any Yahoo Finance ticker
-PERIOD   = "5y"      # 6mo | 1y | 2y | 5y | 10y | max
+TICKER   = "CL=F"    # any Yahoo Finance ticker
+PERIOD   = "max"     # 6mo | 1y | 2y | 5y | 10y | max
 INTERVAL = "1d"      # 1d  | 1wk | 1mo
-HORIZON  = 30        # steps to forecast
+HORIZON  = 15        # steps to forecast
 
-CHRONOS_SIZE = "small"   # tiny | mini | small | base | large
-NHITS_STEPS  = 300       # training iterations
-RUN_BOTH     = True      # False → Chronos only (faster)
+CHRONOS_SIZE     = "large"  # tiny | mini | small | base | large
+MAX_STEPS        = 500      # training iterations for N-HiTS / N-BEATS
+MODELS           = ["N-HiTS", "N-BEATS", "Chronos", "Auto-ARIMA", "XGBoost"]
+SELECTION_METRIC = "mae"    # mae | rmse | mape
 ```
 
 ## Useful tickers
@@ -66,6 +76,8 @@ RUN_BOTH     = True      # False → Chronos only (faster)
 ## Notes
 
 - Chronos uses **zero-shot inference** – no training, fast, good baseline.
-- N-HiTS is trained **from scratch on each run** – slower but can adapt to the specific asset.
-- Both models output **80% prediction intervals** shown as shaded bands.
+- N-HiTS and N-BEATS are trained **from scratch on each run** – slower but can adapt to the specific asset.
+- Auto-ARIMA automatically determines differencing order (ADF test) and searches for the best (p, d, q) via AIC.
+- XGBoost builds a supervised dataset from lag features and forecasts recursively.
+- All models output **80% prediction intervals** shown as shaded bands.
 - The interactive chart includes a **candlestick**, volume subplot, range selector, and forecast bands.
