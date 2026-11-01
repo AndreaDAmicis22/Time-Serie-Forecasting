@@ -18,5 +18,9 @@ extend-ignore = [
     "S608", # possible SQL injection (unprotected query)
 ]
 
+[lint.per-file-ignores]
+# Heavy / optional model libraries are imported lazily, only when the model runs.
+"src/stock_forecast/models/*.py" = ["PLC0415"]
+
 [lint.pydocstyle]
 convention = "google"
