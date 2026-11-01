@@ -22,6 +22,7 @@ extend-ignore = [
 # Heavy / optional model libraries are imported lazily, only when the model runs.
 "src/stock_forecast/models/*.py" = ["PLC0415"]
 "app/*.py" = ["INP001"]
+"tests/*.py" = ["INP001", "PLR2004", "ARG001", "ARG005"]
 
 [lint.pydocstyle]
 convention = "google"

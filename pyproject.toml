@@ -39,6 +39,14 @@ packages = [{ include = "stock_forecast", from = "src" }]
 ipykernel = ">=6.29.0,<8.0.0"
 jupyter = ">=1.0.0"
 nbformat = ">=5.9.0"
+pytest = ">=8.0"
+ruff = ">=0.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+markers = ["slow: downloads pretrained weights or trains neural networks (run with `pytest -m slow`)"]
+addopts = "-m 'not slow'"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
