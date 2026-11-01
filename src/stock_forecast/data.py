@@ -5,17 +5,66 @@ from __future__ import annotations
 import pandas as pd
 import yfinance as yf
 
-# Map of friendly names → yfinance ticker
-PRESET_TICKERS: dict[str, str] = {
-    "S&P 500": "^GSPC",
-    "NASDAQ": "^IXIC",
-    "Gold": "GC=F",
-    "Brent Oil": "BZ=F",
-    "WTI Oil": "CL=F",
-    "BTP 10Y (Italy)": "BTP10Y=F",
-    "EUR/USD": "EURUSD=X",
-    "Bitcoin": "BTC-USD",
+# Category → friendly name → yfinance ticker (drives the asset dropdown of the web app)
+TICKER_CATALOG: dict[str, dict[str, str]] = {
+    "Materie prime": {
+        "Oro": "GC=F",
+        "Argento": "SI=F",
+        "Petrolio WTI": "CL=F",
+        "Petrolio Brent": "BZ=F",
+        "Gas naturale": "NG=F",
+        "Rame": "HG=F",
+        "Platino": "PL=F",
+        "Grano": "ZW=F",
+        "Mais": "ZC=F",
+    },
+    "Indici": {
+        "S&P 500": "^GSPC",
+        "NASDAQ": "^IXIC",
+        "Dow Jones": "^DJI",
+        "FTSE MIB": "FTSEMIB.MI",
+        "DAX": "^GDAXI",
+        "Euro Stoxx 50": "^STOXX50E",
+        "Nikkei 225": "^N225",
+    },
+    "Azioni USA": {
+        "Apple": "AAPL",
+        "Microsoft": "MSFT",
+        "NVIDIA": "NVDA",
+        "Amazon": "AMZN",
+        "Alphabet": "GOOGL",
+        "Meta": "META",
+        "Tesla": "TSLA",
+    },
+    "Azioni Italia": {
+        "ENI": "ENI.MI",
+        "Enel": "ENEL.MI",
+        "Intesa Sanpaolo": "ISP.MI",
+        "UniCredit": "UCG.MI",
+        "Generali": "G.MI",
+        "Ferrari": "RACE.MI",
+        "Stellantis": "STLAM.MI",
+        "Leonardo": "LDO.MI",
+    },
+    "Crypto": {
+        "Bitcoin": "BTC-USD",
+        "Ethereum": "ETH-USD",
+        "Solana": "SOL-USD",
+    },
+    "Valute": {
+        "EUR/USD": "EURUSD=X",
+        "GBP/USD": "GBPUSD=X",
+        "USD/JPY": "JPY=X",
+        "EUR/CHF": "EURCHF=X",
+    },
+    "Tassi": {
+        "Rendimento Treasury USA 10Y": "^TNX",
+        "Rendimento Treasury USA 30Y": "^TYX",
+    },
 }
+
+# Flat map of friendly names → yfinance ticker
+PRESET_TICKERS: dict[str, str] = {name: ticker for group in TICKER_CATALOG.values() for name, ticker in group.items()}
 
 VALID_INTERVALS = ["1d", "1wk", "1mo"]
 VALID_PERIODS = ["6mo", "1y", "2y", "5y", "10y", "max"]
