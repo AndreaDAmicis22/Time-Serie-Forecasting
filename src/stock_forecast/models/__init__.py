@@ -12,7 +12,7 @@ from .base import FAMILIES, MODEL_REGISTRY, ForecastResult, ModelSpec, Param, av
 from .foundation import run_chronos
 from .ml import run_xgboost
 from .neural import run_nbeats, run_nhits
-from .statistical import run_arima
+from .statistical import run_arima, run_drift, run_ets, run_naive, run_theta
 
 __all__ = [
     "FAMILIES",
@@ -25,7 +25,11 @@ __all__ = [
     "register",
     "run_arima",
     "run_chronos",
+    "run_drift",
+    "run_ets",
+    "run_naive",
     "run_nbeats",
     "run_nhits",
+    "run_theta",
     "run_xgboost",
 ]

@@ -1,6 +1,10 @@
-"""Statistical models.
+"""Statistical models and naive baselines.
 
+- **Naive** – random walk (tomorrow = today): the benchmark to beat on prices.
+- **Drift** – random walk with drift.
 - **Auto-ARIMA** – statsmodels SARIMAX with ADF-based differencing + AIC grid search.
+- **AutoETS** – exponential smoothing, configuration picked by AIC.
+- **Theta** – M3-competition winner, a strong simple benchmark.
 """
 
 from __future__ import annotations
@@ -10,7 +14,46 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from .base import STATISTICAL, ForecastResult, Param, make_result, register
+from .base import BASELINE, STATISTICAL, Z_80, ForecastResult, Param, make_result, register
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Naive baselines
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@register(
+    "Naive",
+    family=BASELINE,
+    description="Random walk: la previsione è l'ultimo valore osservato. Sui prezzi è il benchmark da battere.",
+)
+def run_naive(df: pd.DataFrame, horizon: int) -> ForecastResult:
+    """Random-walk forecast with intervals widening as sqrt(h)."""
+    y = df["y"].to_numpy(dtype=float)
+    sigma = np.std(np.diff(y), ddof=1)
+    steps = np.arange(1, horizon + 1)
+
+    yhat = np.full(horizon, y[-1])
+    width = Z_80 * sigma * np.sqrt(steps)
+    return make_result("Naive", df, horizon, yhat, yhat - width, yhat + width)
+
+
+@register(
+    "Drift",
+    family=BASELINE,
+    description="Random walk con drift: proietta la variazione media dello storico.",
+)
+def run_drift(df: pd.DataFrame, horizon: int) -> ForecastResult:
+    """Random walk with drift (Hyndman & Athanasopoulos, FPP3 §5.2)."""
+    y = df["y"].to_numpy(dtype=float)
+    diffs = np.diff(y)
+    drift = diffs.mean()
+    sigma = np.std(diffs - drift, ddof=1)
+    steps = np.arange(1, horizon + 1)
+
+    yhat = y[-1] + drift * steps
+    width = Z_80 * sigma * np.sqrt(steps * (1 + steps / len(diffs)))
+    return make_result("Drift", df, horizon, yhat, yhat - width, yhat + width)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Stationarity helpers
@@ -115,3 +158,64 @@ def run_arima(
     conf_int = np.asarray(forecast_obj.conf_int(alpha=0.2))  # 80% CI
 
     return make_result("Auto-ARIMA", df, horizon, yhat, conf_int[:, 0], conf_int[:, 1])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Exponential smoothing & Theta (statsmodels)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@register(
+    "AutoETS",
+    family=STATISTICAL,
+    description="Exponential smoothing (solo livello, trend, trend smorzato): la configurazione è scelta per AIC.",
+)
+def run_ets(df: pd.DataFrame, horizon: int) -> ForecastResult:
+    """Fit additive-error ETS models and keep the one with the lowest AIC."""
+    from statsmodels.tsa.exponential_smoothing.ets import ETSModel
+
+    # A Series (RangeIndex) rather than an ndarray: get_prediction() needs an index in statsmodels ≥ 0.15.
+    y = pd.Series(df["y"].to_numpy(dtype=float))
+    configs = [
+        {"trend": None},
+        {"trend": "add"},
+        {"trend": "add", "damped_trend": True},
+    ]
+
+    best_fit = None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for config in configs:
+            try:
+                fit = ETSModel(y, error="add", **config).fit(disp=False)
+            except Exception:
+                continue
+            if best_fit is None or fit.aic < best_fit.aic:
+                best_fit = fit
+
+    if best_fit is None:
+        msg = "No ETS configuration could be fitted."
+        raise RuntimeError(msg)
+
+    print(f"  ✅ Best ETS: trend={best_fit.model.trend}, damped={best_fit.model.damped_trend} (AIC={best_fit.aic:.2f})")
+    frame = best_fit.get_prediction(start=len(y), end=len(y) + horizon - 1).summary_frame(alpha=0.2)
+    return make_result("AutoETS", df, horizon, frame["mean"], frame["pi_lower"], frame["pi_upper"])
+
+
+@register(
+    "Theta",
+    family=STATISTICAL,
+    description="Metodo Theta, vincitore della competizione M3: semplice, veloce e robusto.",
+)
+def run_theta(df: pd.DataFrame, horizon: int) -> ForecastResult:
+    """Standard Theta method (theta=2) without deseasonalisation."""
+    from statsmodels.tsa.forecasting.theta import ThetaModel
+
+    y = df["y"].to_numpy(dtype=float)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = ThetaModel(y, deseasonalize=False).fit()
+
+    yhat = np.asarray(fit.forecast(horizon))
+    intervals = np.asarray(fit.prediction_intervals(horizon, alpha=0.2))
+    return make_result("Theta", df, horizon, yhat, intervals[:, 0], intervals[:, 1])
