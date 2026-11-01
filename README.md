@@ -53,7 +53,7 @@ poetry run jupyter lab notebooks/forecast.ipynb
 ## Web app
 
 - **Sidebar** – asset picker by category (indices, commodities such as gold and oil, US / Italian stocks, crypto, FX,
-  rates) or any Yahoo Finance ticker, history length, frequency and horizon.
+  rates), by **ISIN code** or any Yahoo Finance ticker, history length, frequency and horizon.
 - **📈 Previsione** – latest price, forecast and 80% interval, interactive chart (ensemble members can be overlaid),
   forecast table with CSV download.
 - **🧪 Backtest** – metrics of every model, best first, and their out-of-sample forecasts against the actual prices.
@@ -81,6 +81,24 @@ plot_forecast(forecast, ticker="Gold", show_members=True).show()
 
 Every model can also be called directly, e.g. `MODEL_REGISTRY["Chronos-2"](df, horizon=15)`.
 
+## ISIN codes
+
+`download_series`, `get_ticker_info` and the web app accept an ISIN instead of a ticker:
+
+- **Yahoo Finance search** resolves the ISIN to the instrument's main listing;
+- **[OpenFIGI](https://www.openfigi.com/api)** – Bloomberg's free mapping API, no key required – adds the same
+  instrument on the other main exchanges, keeping only the symbols Yahoo Finance has prices for. E.g. the iShares Core
+  MSCI World ETF `IE00B4L5Y983` is listed as `IWDA.L` (London, USD) but also as `SWDA.MI` (Borsa Italiana, EUR).
+
+```python
+from stock_forecast.data import download_series, lookup_isin
+
+lookup_isin("IE00B4L5Y983")           # IWDA.L, SWDA.MI, IWDA.AS, …
+df = download_series("IT0003132476")  # ENI → ENI.MI
+```
+
+Stocks, ETFs and ETCs are covered; bonds (e.g. BTPs) and unlisted funds are not on Yahoo Finance.
+
 ## Project structure
 
 ```
@@ -90,7 +108,7 @@ Time-Serie-Forecasting/
 ├── src/
 │   └── stock_forecast/
 │       ├── __init__.py       # public API
-│       ├── data.py           # yfinance download + ticker catalog
+│       ├── data.py           # yfinance download, ticker catalog, ISIN lookup
 │       ├── metrics.py        # MAE, RMSE, MAPE, MAE/Naive, coverage
 │       ├── backtest.py       # rolling-origin windows, validate_models
 │       ├── ensemble.py       # weights and forecast combination

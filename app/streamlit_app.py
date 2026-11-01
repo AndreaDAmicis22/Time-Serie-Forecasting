@@ -11,7 +11,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from stock_forecast.data import TICKER_CATALOG, VALID_INTERVALS, VALID_PERIODS, download_series, get_ticker_info
+from stock_forecast.data import (
+    TICKER_CATALOG,
+    VALID_INTERVALS,
+    VALID_PERIODS,
+    download_series,
+    get_ticker_info,
+    is_valid_isin,
+    lookup_isin,
+)
 from stock_forecast.ensemble import ENSEMBLE_METHODS, EnsembleResult
 from stock_forecast.metrics import SELECTION_METRICS
 from stock_forecast.models import FAMILIES, MODEL_REGISTRY, Param
@@ -21,6 +29,7 @@ from stock_forecast.plot import plot_backtest, plot_forecast
 st.set_page_config(page_title="Stock Forecast", page_icon="📈", layout="wide")
 
 CUSTOM_TICKER = "✏️ Ticker personalizzato"
+ISIN_LOOKUP = "🔎 Codice ISIN"
 DEFAULT_MODELS = ("Chronos-2", "Timestral", "TimesFM-3", "TiRex", "Chronos-Bolt", "Theta", "Naive")
 STRATEGY_LABELS = {
     "auto": "🤖 Automatica – ensemble solo se batte il miglior modello",
@@ -43,6 +52,16 @@ def load_series(ticker: str, period: str, interval: str) -> pd.DataFrame:
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def load_info(ticker: str) -> dict:
     return get_ticker_info(ticker)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Cerco le quotazioni dell'ISIN…")
+def find_listings(isin: str) -> list[dict[str, str]]:
+    listings = lookup_isin(isin)
+    if not listings:
+        # Raising instead of returning [] keeps a network hiccup out of the cache.
+        msg = "Nessuna quotazione trovata su Yahoo Finance: obbligazioni e fondi non quotati non sono coperti."
+        raise LookupError(msg)
+    return listings
 
 
 def param_widget(model: str, param: Param) -> object:
@@ -94,10 +113,36 @@ def metrics_table(validation_results: dict[str, dict], metric: str) -> pd.DataFr
 with st.sidebar:
     st.title("📈 Stock Forecast")
 
-    category = st.selectbox("Categoria", [*TICKER_CATALOG, CUSTOM_TICKER])
+    category = st.selectbox("Categoria", [*TICKER_CATALOG, ISIN_LOOKUP, CUSTOM_TICKER])
     if category == CUSTOM_TICKER:
         ticker = st.text_input("Ticker Yahoo Finance", value="AAPL", help="Es. AAPL, ENI.MI, GC=F, BTC-USD").strip().upper()
         asset_name = ticker
+    elif category == ISIN_LOOKUP:
+        isin = st.text_input(
+            "Codice ISIN",
+            placeholder="es. IE00B4L5Y983",
+            help="Azioni, ETF ed ETC quotati, risolti con Yahoo Finance e OpenFIGI. "
+            "Obbligazioni e fondi non quotati non sono coperti.",
+        ).strip()
+        listings = []
+        if isin and not is_valid_isin(isin):
+            st.error("Codice ISIN non valido: controlla i 12 caratteri.")
+        elif isin:
+            try:
+                listings = find_listings(isin.upper())
+            except LookupError as e:
+                st.warning(str(e))
+        if listings:
+            by_symbol = {listing["symbol"]: listing for listing in listings}
+            ticker = st.selectbox(
+                "Quotazione",
+                list(by_symbol),
+                format_func=lambda symbol: f"{symbol} · {by_symbol[symbol]['exchange']}",
+                help="Lo stesso strumento su borse diverse: le quotazioni di Milano sono in EUR.",
+            )
+            asset_name = by_symbol[ticker]["name"]
+        else:
+            ticker = asset_name = ""
     else:
         assets = TICKER_CATALOG[category]
         asset_name = st.selectbox("Asset", list(assets), format_func=lambda name: f"{name} · {assets[name]}")

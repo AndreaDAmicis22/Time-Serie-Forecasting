@@ -45,7 +45,7 @@ ruff = ">=0.12"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]
-markers = ["slow: downloads pretrained weights or trains neural networks (run with `pytest -m slow`)"]
+markers = ["slow: needs the network, downloads pretrained weights or trains neural networks (run with `pytest -m slow`)"]
 addopts = "-m 'not slow'"
 
 [build-system]
