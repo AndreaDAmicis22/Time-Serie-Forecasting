@@ -1,0 +1,8 @@
+# Streamlit settings – picked up when the app is launched from the repository root.
+
+[theme]
+base = "dark"
+primaryColor = "#3987e5"
+
+[browser]
+gatherUsageStats = false

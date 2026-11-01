@@ -1,7 +1,7 @@
 [project]
 name = "stock-forecast"
 version = "0.1.0"
-description = "Time-series stock/commodity forecasting with Chronos and N-HiTS"
+description = "Time-series stock/commodity forecasting with foundation models, ensembles and a web app"
 authors = [
     {name = "Andrea D'Amicis"}
 ]
@@ -23,6 +23,7 @@ dependencies = [
     "chronos-forecasting (>=2.2.2,<3.0.0)",
     "statsmodels",
     "xgboost",
+    "streamlit (>=1.50)",
 ]
 
 [project.optional-dependencies]
