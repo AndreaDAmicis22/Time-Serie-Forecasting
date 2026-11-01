@@ -25,6 +25,12 @@ dependencies = [
     "xgboost",
 ]
 
+[project.optional-dependencies]
+# Extra foundation models – see README for their licenses.
+timesfm = ["timesfm[torch] (>=3.0.0)"]
+tirex = ["tirex-ts (>=1.4.0)"]
+timestral = ["timestral @ git+https://github.com/mistralai/timestral.git"]
+
 [tool.poetry]
 packages = [{ include = "stock_forecast", from = "src" }]
 

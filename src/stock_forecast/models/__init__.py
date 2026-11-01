@@ -9,7 +9,7 @@ with ``@register(...)``: the pipeline and the web app pick it up automatically.
 """
 
 from .base import FAMILIES, MODEL_REGISTRY, ForecastResult, ModelSpec, Param, available_models, get_model, register
-from .foundation import run_chronos
+from .foundation import run_chronos, run_chronos2, run_chronos_bolt, run_timesfm, run_timestral, run_tirex
 from .ml import run_xgboost
 from .neural import run_nbeats, run_nhits
 from .statistical import run_arima, run_drift, run_ets, run_naive, run_theta
@@ -25,11 +25,16 @@ __all__ = [
     "register",
     "run_arima",
     "run_chronos",
+    "run_chronos2",
+    "run_chronos_bolt",
     "run_drift",
     "run_ets",
     "run_naive",
     "run_nbeats",
     "run_nhits",
     "run_theta",
+    "run_timesfm",
+    "run_timestral",
+    "run_tirex",
     "run_xgboost",
 ]
