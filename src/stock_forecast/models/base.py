@@ -152,12 +152,15 @@ def available_models() -> list[str]:
 
 def infer_freq(ds: pd.Series) -> str:
     """Infer pandas frequency string from a datetime series."""
-    diffs = ds.sort_values().diff().dropna()
-    median_days = diffs.dt.days.median()
+    ds = ds.sort_values()
+    median_days = ds.diff().dropna().dt.days.median()
     if median_days <= 1.5:
-        return "B"  # business day
+        # Markets trading on weekends (crypto) need calendar days, not business days.
+        weekend_share = (ds.dt.dayofweek >= 5).mean()
+        return "D" if weekend_share > 0.1 else "B"
     if median_days <= 8:
-        return "W"
+        # Anchor on the weekday of the bars (yfinance weekly bars start on Monday).
+        return f"W-{ds.iloc[-1].day_name()[:3].upper()}"
     if median_days <= 32:
         return "MS"
     return "QS"
